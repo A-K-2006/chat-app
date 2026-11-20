@@ -1,0 +1,205 @@
+name: CI/CD - Deploy to Azure Container Apps
+
+# Runs tests on every push and pull request.
+# Deploys to Azure only on pushes to main (or when started manually).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Never run two deployments at once
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RG: chat-rg                      # change if your resource group has another name
+  BACKEND_APP: chat-backend
+  FRONTEND_APP: chat-frontend
+
+jobs:
+  # ------------------------------------------------------------------ tests
+  test:
+    name: Test backend and build frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Backend tests
+        working-directory: backend
+        run: mvn -B verify
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Frontend build check
+        working-directory: frontend
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
+  # ------------------------------------------------------------------ deploy
+  deploy:
+    name: Build in ACR and deploy
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production        # optional: add required reviewers in GitHub settings
+    permissions:
+      contents: read
+    env:
+      ACR_NAME: ${{ secrets.ACR_NAME }}
+      TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install Container Apps extension
+        run: az extension add --name containerapp --upgrade --only-show-errors
+
+      # ---------------------------------------------------------- backend
+      - name: Build backend image in ACR
+        run: az acr build -r "$ACR_NAME" -t "chat-backend:$TAG" ./backend
+
+      - name: Deploy backend
+        id: backend
+        run: |
+          PREV_IMAGE=$(az containerapp show -n "$BACKEND_APP" -g "$RG" \
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "prev_image=$PREV_IMAGE" >> "$GITHUB_OUTPUT"
+
+          # Keep exactly one replica: the STOMP broker is in memory
+          az containerapp update -n "$BACKEND_APP" -g "$RG" \
+            --image "$ACR_NAME.azurecr.io/chat-backend:$TAG" \
+            --min-replicas 1 --max-replicas 1 --only-show-errors
+
+          BACKEND_HOST=$(az containerapp show -n "$BACKEND_APP" -g "$RG" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "backend_host=$BACKEND_HOST" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for backend health
+        run: |
+          HOST="${{ steps.backend.outputs.backend_host }}"
+          for i in $(seq 1 40); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://$HOST/actuator/health" || true)
+            echo "attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "Backend did not become healthy"
+          exit 1
+
+      - name: Roll back backend on failure
+        if: failure() && steps.backend.outputs.prev_image != ''
+        run: |
+          echo "Rolling back to ${{ steps.backend.outputs.prev_image }}"
+          az containerapp update -n "$BACKEND_APP" -g "$RG" \
+            --image "${{ steps.backend.outputs.prev_image }}" --only-show-errors
+
+      # ---------------------------------------------------------- frontend
+      # The nginx config is generated in a temp copy, so the repo's
+      # frontend/nginx.conf (proxying to backend:8080 for docker-compose)
+      # stays untouched.
+      - name: Prepare frontend build context
+        run: |
+          BACKEND_HOST="${{ steps.backend.outputs.backend_host }}"
+          mkdir -p "$RUNNER_TEMP/frontend"
+          cp -r frontend/. "$RUNNER_TEMP/frontend/"
+          cat > "$RUNNER_TEMP/frontend/nginx.conf" <<'NGINX'
+          server {
+              listen 80;
+              server_name _;
+              root /usr/share/nginx/html;
+              index index.html;
+              client_max_body_size 12m;
+
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+
+              location /api/ {
+                  proxy_pass https://__BACKEND__;
+                  proxy_ssl_server_name on;
+                  proxy_set_header Host __BACKEND__;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location /ws/ {
+                  proxy_pass https://__BACKEND__;
+                  proxy_ssl_server_name on;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host __BACKEND__;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+                  proxy_buffering off;
+              }
+
+              location = /healthz {
+                  return 200 'ok';
+                  add_header Content-Type text/plain;
+              }
+
+              gzip on;
+              gzip_types text/css application/javascript application/json image/svg+xml;
+          }
+          NGINX
+          sed -i "s#__BACKEND__#${BACKEND_HOST}#g" "$RUNNER_TEMP/frontend/nginx.conf"
+          grep -n "proxy_pass" "$RUNNER_TEMP/frontend/nginx.conf"
+
+      - name: Build frontend image in ACR
+        run: az acr build -r "$ACR_NAME" -t "chat-frontend:$TAG" "$RUNNER_TEMP/frontend"
+
+      - name: Deploy frontend
+        id: frontend
+        run: |
+          az containerapp update -n "$FRONTEND_APP" -g "$RG" \
+            --image "$ACR_NAME.azurecr.io/chat-frontend:$TAG" --only-show-errors
+          FRONTEND_HOST=$(az containerapp show -n "$FRONTEND_APP" -g "$RG" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "frontend_host=$FRONTEND_HOST" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------- smoke test
+      - name: Smoke test
+        run: |
+          HOST="${{ steps.frontend.outputs.frontend_host }}"
+          sleep 20
+          PAGE=$(curl -s -o /dev/null -w '%{http_code}' "https://$HOST/" || true)
+          API=$(curl -s -o /dev/null -w '%{http_code}' -X POST "https://$HOST/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"ci-smoke","password":"wrongpass1"}' || true)
+          echo "frontend page: HTTP $PAGE"
+          echo "login via proxy: HTTP $API (expect 400/401/403, not 404/502)"
+          if [ "$PAGE" != "200" ]; then exit 1; fi
+          if [ "$API" = "404" ] || [ "$API" = "502" ] || [ "$API" = "000" ]; then exit 1; fi
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- App: https://${{ steps.frontend.outputs.frontend_host }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Azure logout
+        if: always()
+        run: az logout || true
