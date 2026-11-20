@@ -811,10 +811,6 @@ Also planned: refresh-token revocation, rate limiting on login/register/uploads,
 Built as a portfolio project to demonstrate production backend practices.
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## 📄 License
-
-MIT — do whatever, just don't blame me.
-
 ---
 
 ⭐ *If this project helped you, consider giving it a star!*
